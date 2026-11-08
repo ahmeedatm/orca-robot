@@ -7,7 +7,7 @@
 // même, mais une copie neuve est refusée (« endommagé », vu le 2026-11-04). Possible parce que le fusible
 // EnableEmbeddedAsarIntegrityValidation est éteint ; verifierFusible() s'arrête sinon.
 // Pendant que l'app tourne : les anciens fichiers à nom haché sont gardés, une fenêtre ouverte peut encore les charger.
-// Usage : node fork/greffer.mjs --app /Applications/Orca.app --version <x.y.z> --commit <sha>
+// Usage : node greffer.mjs --app /Applications/Orca.app --depot <clone du fork compilé> --version <x.y.z> --commit <sha>
 import { execFileSync } from 'node:child_process'
 import {
   cpSync,
@@ -24,10 +24,26 @@ import {
 } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 
-const DEPOT = join(dirname(new URL(import.meta.url).pathname), '..')
+const { values: args } = parseArgs({
+  options: {
+    app: { type: 'string' },
+    depot: { type: 'string' },
+    version: { type: 'string' },
+    commit: { type: 'string' }
+  }
+})
+for (const cle of ['app', 'depot', 'version', 'commit']) {
+  if (!args[cle]) {
+    console.error(`greffer : --${cle} manquant`)
+    process.exit(1)
+  }
+}
+
+// Les modules et la configuration de la version compilée viennent du clone du fork : le robot n'a aucune dépendance.
+const DEPOT = resolve(args.depot)
 const require = createRequire(join(DEPOT, 'package.json'))
 const asar = require('@electron/asar')
 const { FuseV1Options, getCurrentFuseWire } = require('@electron/fuses')
@@ -43,14 +59,6 @@ const DOSSIERS_HACHES = ['out/renderer/assets/', 'out/main/chunks/']
 // Version mobile : pas de changement du fork, et sa compilation demande la chaîne Expo ; on garde l'officielle.
 const GARDE_OFFICIEL = 'out/mobile-web/'
 
-const { values: args } = parseArgs({
-  options: { app: { type: 'string' }, version: { type: 'string' }, commit: { type: 'string' } }
-})
-for (const cle of ['app', 'version', 'commit']) {
-  if (!args[cle]) {
-    arreter(`--${cle} manquant`)
-  }
-}
 const RESSOURCES = join(args.app, 'Contents/Resources')
 const ARCHIVE = join(RESSOURCES, 'app.asar')
 

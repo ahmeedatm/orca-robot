@@ -1,11 +1,12 @@
 #!/bin/bash
-# Robot du fork ahmeedatm/orca : regreffe le JavaScript du fork dans /Applications/Orca.app quand Orca a changé de
-# version (mise à jour officielle) ou quand la branche ahmed a avancé (nouvel ajout fusionné).
+# Robot d'un fork d'Orca : regreffe le JavaScript du fork dans /Applications/Orca.app quand Orca a changé de version
+# (mise à jour officielle) ou quand la branche suivie a avancé (nouvel ajout fusionné). Le dépôt et la branche viennent
+# du fichier local ~/.config/orca-robot/cible (« <url> <branche> », écrit par installer-robot.sh).
 #
 #   robot.sh             précommande de l'automatisation Orca (toutes les 15 min, voir installer-robot.sh) : rapide.
 #                        Sort en 1 (rien pour l'agent) en lançant au besoin le travail détaché ; sort en 0 (l'agent
 #                        démarre) une seule fois par échec nouveau.
-#   robot.sh --travail   le travail : rebase d'ahmed sur le tag de la version installée, compilation, tests, greffe.
+#   robot.sh --travail   le travail : rebase de la branche sur le tag de la version installée, compilation, tests, greffe.
 #
 # Pourquoi détaché : la précommande est coupée au bout de 120 s (installer-robot.sh), la compilation prend ~4 min.
 # Pourquoi lancé par Orca et pas launchd : macOS (« Gestion des apps ») refuse à un script de launchd d'écrire dans
@@ -13,22 +14,30 @@
 # Échec passager (réseau) : réessayé au passage suivant, agent au 4e de suite. Échec durable : agent tout de suite.
 set -Eeuo pipefail
 
-APP=/Applications/Orca.app
-DEPOT="${ORCA_FORK_DEPOT:-$HOME/.local/share/orca-fork/depot}" # clone réservé au robot, jamais édité à la main
-DOSSIER_ETAT="$HOME/Library/Logs/orca-fork"
+APP="${ORCA_FORK_APP:-/Applications/Orca.app}"
+DEPOT="${ORCA_FORK_DEPOT:-$HOME/.local/share/orca-fork/depot}" # clone du fork réservé au robot, jamais édité à la main
+DOSSIER_ETAT="${ORCA_FORK_ETAT:-$HOME/Library/Logs/orca-fork}"
+ICI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESERVE="$HOME/.local/share/orca-robot"     # clone réservé de ce dépôt, le seul qui se met à jour tout seul
+CIBLE="$HOME/.config/orca-robot/cible"      # « <url> <branche> »
+EPINGLE="$HOME/.config/orca-robot/epingle"  # commit d'orca-robot à garder ; absent = suit main
 JOURNAL="$DOSSIER_ETAT/robot.log"
-ECHEC="$DOSSIER_ETAT/echec"           # « version sha-ahmed raison » du dernier échec durable
+ECHEC="$DOSSIER_ETAT/echec"           # « version sha-branche raison » du dernier échec durable
 ECHEC_SIGNALE="$DOSSIER_ETAT/signale" # dernier échec déjà confié à un agent
 PASSAGERS="$DOSSIER_ETAT/passagers"   # échecs passagers de suite
 VERROU="$DOSSIER_ETAT/travail.verrou" # dossier ; contient le pid du travail
 RETARD="$DOSSIER_ETAT/retard"         # date de la première fois où une version plus récente a été vue
-FORK=https://github.com/ahmeedatm/orca.git
+# En dur, jamais lue dans la cible : ce code s'exécute avec le droit d'écrire dans Orca.app.
+ROBOT_URL=https://github.com/ahmeedatm/orca-robot.git
 AMONT=https://github.com/stablyai/orca.git
+FORK=""    # adresse et branche lues dans la cible
+BRANCHE="?"
 PASSAGERS_MAX=4
 ECHEC_REESSAI_MIN=360 # un échec durable est retenté après 6 h même si rien n'a bougé
 RETARD_MAX_MIN=4320   # 3 jours sans installer une version officielle plus récente : la mise à jour est peut-être bloquée
 VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
-mkdir -p "$DOSSIER_ETAT"
+URL_RE='^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\.git$'
+SHA_RE='^[0-9a-f]{40}$'
 
 journal() { echo "$(date '+%F %T') $*" >>"$JOURNAL"; }
 # Texte passé en argument à AppleScript, jamais collé dans le code AppleScript.
@@ -52,7 +61,7 @@ repere() {
 
 echouer() {
   journal "ÉCHEC : $1"
-  echo "$VERSION_EN_COURS $(git -C "$DEPOT" rev-parse origin/ahmed 2>/dev/null || echo ?) $1" >"$ECHEC"
+  echo "$VERSION_EN_COURS $(git -C "$DEPOT" rev-parse --verify --quiet "origin/$BRANCHE" 2>/dev/null || echo ?) $1" >"$ECHEC"
   rm -f "$PASSAGERS"
   notifier "Greffe du fork ratée : $1. Un agent va regarder."
   exit 1
@@ -63,6 +72,65 @@ passager() {
   ((n >= PASSAGERS_MAX)) && echouer "$1 ($n fois de suite)"
   journal "passager ($n/$PASSAGERS_MAX) : $1, nouvel essai au passage suivant"
   exit 1
+}
+
+# Réglage local refusé : une seule alerte, pas une à chaque passage. Le contenu du fichier n'entre pas dans le message
+# (il part vers l'agent).
+reglage_refuse() {
+  if [[ -f "$ECHEC" && "$(cut -d' ' -f3- "$ECHEC")" == "$1" ]]; then exit 1; fi
+  echouer "$1"
+}
+
+cible_valide() {
+  [[ "$1" =~ $URL_RE && "$2" != -* ]] && git check-ref-format --branch "$2" >/dev/null 2>&1
+}
+
+lire_cible() {
+  [[ -f "$CIBLE" ]] || reglage_refuse "cible absente : $CIBLE (relancer installer-robot.sh)"
+  local url="" branche="" reste=""
+  read -r url branche reste <"$CIBLE" || true
+  if [[ -n "$reste" ]] || ! cible_valide "$url" "$branche"; then
+    reglage_refuse "cible invalide : $CIBLE (attendu : https://github.com/<compte>/<dépôt>.git <branche>)"
+  fi
+  FORK="$url"
+  BRANCHE="$branche"
+}
+
+# Seul le clone réservé se met à jour. Appelée hors travail : un travail en cours garde sa version jusqu'au bout.
+mettre_a_jour_robot() {
+  [[ -z "${ORCA_ROBOT_MAJ:-}" && "$ICI" == "$RESERVE" ]] || return 0
+  git -C "$RESERVE" remote set-url origin "$ROBOT_URL"
+  local actuel vise
+  actuel="$(git -C "$RESERVE" rev-parse HEAD)"
+  if [[ -f "$EPINGLE" ]]; then
+    vise="$(cat "$EPINGLE")"
+    [[ "$vise" =~ $SHA_RE ]] || reglage_refuse "épingle invalide : $EPINGLE (attendu : un commit complet)"
+    [[ "$actuel" != "$vise" ]] || return 0
+    git -C "$RESERVE" cat-file -e "$vise^{commit}" 2>/dev/null ||
+      git -C "$RESERVE" fetch --quiet origin main 2>/dev/null || true
+    git -C "$RESERVE" cat-file -e "$vise^{commit}" 2>/dev/null ||
+      git -C "$RESERVE" fetch --quiet origin "$vise" 2>/dev/null || true
+    if ! git -C "$RESERVE" cat-file -e "$vise^{commit}" 2>/dev/null; then
+      journal "épingle $vise introuvable, version en place gardée"
+      return 0
+    fi
+  else
+    if ! git -C "$RESERVE" fetch --quiet origin main 2>/dev/null; then
+      journal "orca-robot injoignable, version en place gardée"
+      return 0
+    fi
+    vise="$(git -C "$RESERVE" rev-parse FETCH_HEAD)"
+    [[ "$actuel" != "$vise" ]] || return 0
+  fi
+  git -C "$RESERVE" checkout --quiet --force --detach "$vise"
+  if ! /bin/bash -n "$RESERVE/robot.sh" || ! /bin/bash -n "$RESERVE/installer-robot.sh" ||
+    ! node --check "$RESERVE/greffer.mjs" 2>/dev/null; then
+    git -C "$RESERVE" checkout --quiet --force --detach "$actuel"
+    journal "nouvelle version d'orca-robot refusée (${vise:0:10}) : script invalide"
+    return 0
+  fi
+  journal "orca-robot mis à jour : ${actuel:0:10} -> ${vise:0:10}"
+  ORCA_ROBOT_MAJ=1 exec /bin/bash "$RESERVE/robot.sh"
 }
 
 # Filet : la mise à jour officielle d'une app au sceau des ressources rompu n'a pas encore été vue en vrai.
@@ -98,24 +166,26 @@ verifier() {
     kill -0 "$(cat "$VERROU/pid" 2>/dev/null || echo 0)" 2>/dev/null && exit 1 # travail en cours
     rm -r "$VERROU"                                                              # travail tué en route
   fi
+  mettre_a_jour_robot
+  lire_cible
   local version distant
   version="$(version_installee)"
   surveiller_mises_a_jour "$version"
-  distant="$(git ls-remote "$FORK" refs/heads/ahmed | cut -f1)" || true
+  distant="$(git ls-remote "$FORK" "refs/heads/$BRANCHE" | cut -f1)" || true
   [[ -n "$distant" ]] || {
     journal "fork injoignable"
     exit 1
   }
   if [[ "$(repere version)" == "$version" && "$(repere commit)" == "$distant" ]]; then exit 1; fi
-  # Même version et même ahmed qu'à l'échec : on attend que l'agent répare (il fera avancer ahmed) ou 6 h.
+  # Même version et même branche qu'à l'échec : on attend que l'agent répare (il la fera avancer) ou 6 h.
   [[ -f "$ECHEC" && "$(cut -d' ' -f1-2 "$ECHEC")" == "$version $distant" ]] && exit 1
-  journal "greffe à refaire : Orca $version, ahmed ${distant:0:10} (en place : $(repere version) $(repere commit | cut -c1-10))"
-  # Copie du script : le travail change de commit dans le dépôt, il ne doit pas réécrire le script en cours.
-  local copie
-  copie="$(mktemp "${TMPDIR:-/tmp}/orca-fork-robot.XXXXXX")"
-  cp "$0" "$copie"
-  /usr/bin/perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV' /bin/bash "$copie" --travail >>"$JOURNAL" 2>&1 </dev/null &
+  journal "greffe à refaire : Orca $version, $BRANCHE ${distant:0:10} (en place : $(repere version) $(repere commit | cut -c1-10))"
+  lancer_travail
   exit 1
+}
+
+lancer_travail() {
+  /usr/bin/perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV' /bin/bash "$ICI/robot.sh" --travail >>"$JOURNAL" 2>&1 </dev/null &
 }
 
 preparer_depot() {
@@ -124,32 +194,41 @@ preparer_depot() {
     git clone --quiet --filter=blob:none "$FORK" "$DEPOT" || passager "clone du fork"
     git -C "$DEPOT" remote add upstream "$AMONT"
   fi
+  git -C "$DEPOT" remote set-url origin "$FORK"
   # Clone sans fichiers : ceux d'une nouvelle version n'existent que chez l'amont, pas encore dans le fork.
   git -C "$DEPOT" config remote.upstream.promisor true
   git -C "$DEPOT" config remote.upstream.partialclonefilter blob:none
-  git -C "$DEPOT" fetch --quiet origin ahmed || passager "fetch du fork"
+  git -C "$DEPOT" fetch --quiet origin "$BRANCHE" || passager "fetch du fork"
   if ! git -C "$DEPOT" rev-parse --verify --quiet "refs/tags/$1" >/dev/null; then
     git -C "$DEPOT" fetch --quiet upstream "refs/tags/$1:refs/tags/$1" || passager "tag $1 introuvable chez stablyai/orca"
   fi
+  # Un dépôt qui n'est pas un fork GitHub n'a aucun tag : la base de la branche vient alors de l'amont.
+  if ! base_de_la_branche >/dev/null; then
+    git -C "$DEPOT" fetch --quiet upstream 'refs/tags/v*:refs/tags/v*' || passager "tags de stablyai/orca"
+  fi
 }
 
-# Recolle ahmed sur le tag de la version installée, et pousse ahmed s'il a fallu le déplacer.
+base_de_la_branche() {
+  git -C "$DEPOT" describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "origin/$BRANCHE" 2>/dev/null
+}
+
+# Recolle la branche sur le tag de la version installée, et la pousse s'il a fallu la déplacer.
 recoller() {
   local tag="$1" base
-  base="$(git -C "$DEPOT" describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' origin/ahmed)" ||
-    echouer "aucun tag de version sous ahmed"
-  [[ "${base#v}" =~ $VERSION_RE ]] || echouer "base d'ahmed inattendue : $base"
-  git -C "$DEPOT" checkout --quiet --force -B robot origin/ahmed
+  base="$(base_de_la_branche)" || echouer "aucun tag de version sous $BRANCHE"
+  [[ "${base#v}" =~ $VERSION_RE ]] || echouer "base de $BRANCHE inattendue : $base"
+  git -C "$DEPOT" checkout --quiet --force -B robot "origin/$BRANCHE"
   [[ "$base" == "$tag" ]] && return 0
   if [[ "$(printf '%s\n%s\n' "${base#v}" "${tag#v}" | sort -V | head -1)" == "${tag#v}" ]]; then
     echouer "Orca installé ($tag) plus ancien que la base du fork ($base) : mettre Orca à jour"
   fi
-  journal "rebase d'ahmed : $base -> $tag"
+  journal "rebase de $BRANCHE : $base -> $tag"
   if ! git -C "$DEPOT" rebase --quiet --onto "$tag" "$base" robot >>"$JOURNAL" 2>&1; then
     git -C "$DEPOT" rebase --abort || true
-    echouer "conflit en recollant ahmed de $base sur $tag"
+    echouer "conflit en recollant $BRANCHE de $base sur $tag"
   fi
-  git -C "$DEPOT" push --quiet --force-with-lease=ahmed:origin/ahmed origin robot:ahmed || passager "push d'ahmed refusé"
+  git -C "$DEPOT" push --quiet "--force-with-lease=refs/heads/$BRANCHE:refs/remotes/origin/$BRANCHE" origin "robot:refs/heads/$BRANCHE" ||
+    passager "push de $BRANCHE refusé"
 }
 
 compiler() {
@@ -183,7 +262,6 @@ liberer() {
 }
 
 travailler() {
-  if [[ "$(basename "$0")" == orca-fork-robot.* ]]; then rm -f -- "$0"; fi # copie faite par verifier(), déjà lue
   mkdir "$VERROU" 2>/dev/null || exit 0
   echo "$$" >"$VERROU/pid"
   CALES="$(mktemp -d "${TMPDIR:-/tmp}/orca-fork-pnpm.XXXXXX")"
@@ -192,30 +270,44 @@ travailler() {
   # PATH minimal sous Orca : node, gh (identifiants git) et les cales doivent être trouvés dès le push.
   export PATH="$CALES:/opt/homebrew/bin:/usr/local/bin:$PATH"
   VERSION_EN_COURS="$(version_installee)"
+  lire_cible
   local tag="v$VERSION_EN_COURS"
   journal "début : Orca $VERSION_EN_COURS"
   preparer_depot "$tag"
   recoller "$tag"
   compiler "$tag"
   local commit
-  commit="$(git -C "$DEPOT" rev-parse HEAD)" # égal à origin/ahmed : recoller() a poussé ce qu'il a déplacé
+  commit="$(git -C "$DEPOT" rev-parse HEAD)" # égal à origin/$BRANCHE : recoller() a poussé ce qu'il a déplacé
   if [[ "$(version_installee)" != "$VERSION_EN_COURS" ]]; then
     journal "Orca a changé de version pendant la compilation, nouvel essai au passage suivant"
     exit 1
   fi
-  node "$DEPOT/fork/greffer.mjs" --app "$APP" --version "$VERSION_EN_COURS" --commit "$commit" >>"$JOURNAL" 2>&1 ||
+  node "$ICI/greffer.mjs" --app "$APP" --depot "$DEPOT" --version "$VERSION_EN_COURS" --commit "$commit" >>"$JOURNAL" 2>&1 ||
     echouer "greffe"
   rm -f "$ECHEC" "$ECHEC_SIGNALE" "$PASSAGERS"
   journal "greffe posée : Orca $VERSION_EN_COURS, fork ${commit:0:10}"
-  notifier "Ton Orca perso est prêt ($VERSION_EN_COURS). Redémarre Orca pour l'utiliser."
+  notifier "Ton Orca est prêt ($VERSION_EN_COURS). Redémarre Orca pour l'utiliser."
 }
 
-VERSION_EN_COURS="?"
-case "${1:-}" in
-  --travail) travailler ;;
-  "") verifier ;;
-  *)
-    echo "usage : robot.sh [--travail]" >&2
-    exit 2
-    ;;
-esac
+# Précommande sous le PATH minimal d'Orca : node, et gh ou le trousseau pour lire un dépôt privé. Sans invite de mot de
+# passe : personne ne répondrait, et la précommande serait coupée au bout de 120 s.
+preparer_env() {
+  mkdir -p "$DOSSIER_ETAT"
+  export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+  export GIT_TERMINAL_PROMPT=0
+}
+
+principal() {
+  preparer_env
+  VERSION_EN_COURS="?"
+  case "${1:-}" in
+    --travail) travailler ;;
+    "") verifier ;;
+    *)
+      echo "usage : robot.sh [--travail]" >&2
+      exit 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then principal "$@"; fi
