@@ -81,6 +81,12 @@ reglage_refuse() {
   echouer "$1"
 }
 
+travail_en_cours() {
+  local pid
+  pid="$(cat "$VERROU/pid" 2>/dev/null || true)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
 cible_valide() {
   [[ "$1" =~ $URL_RE && "$2" != -* ]] && git check-ref-format --branch "$2" >/dev/null 2>&1
 }
@@ -163,7 +169,7 @@ verifier() {
     exit 0
   fi
   if [[ -d "$VERROU" ]]; then
-    kill -0 "$(cat "$VERROU/pid" 2>/dev/null || echo 0)" 2>/dev/null && exit 1 # travail en cours
+    travail_en_cours && exit 1
     rm -r "$VERROU"                                                              # travail tué en route
   fi
   mettre_a_jour_robot
@@ -216,13 +222,14 @@ base_de_la_branche() {
 recoller() {
   local tag="$1" base
   base="$(base_de_la_branche)" || echouer "aucun tag de version sous $BRANCHE"
-  [[ "${base#v}" =~ $VERSION_RE ]] || echouer "base de $BRANCHE inattendue : $base"
+  [[ "${base#v}" =~ $VERSION_RE ]] || echouer "base de $BRANCHE inattendue (tag de version non reconnu)"
   git -C "$DEPOT" checkout --quiet --force -B robot "origin/$BRANCHE"
   [[ "$base" == "$tag" ]] && return 0
   if [[ "$(printf '%s\n%s\n' "${base#v}" "${tag#v}" | sort -V | head -1)" == "${tag#v}" ]]; then
     echouer "Orca installé ($tag) plus ancien que la base du fork ($base) : mettre Orca à jour"
   fi
-  journal "rebase de $BRANCHE : $base -> $tag"
+  # L'ancien sommet reste au journal : après le push forcé, c'est le moyen de retrouver un commit écarté par le rebase.
+  journal "rebase de $BRANCHE : $base -> $tag (ancien sommet $(git -C "$DEPOT" rev-parse "origin/$BRANCHE"))"
   if ! git -C "$DEPOT" rebase --quiet --onto "$tag" "$base" robot >>"$JOURNAL" 2>&1; then
     git -C "$DEPOT" rebase --abort || true
     echouer "conflit en recollant $BRANCHE de $base sur $tag"
@@ -234,7 +241,7 @@ recoller() {
 compiler() {
   local tag="$1" pnpm_version
   pnpm_version="$(/usr/bin/python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["packageManager"].split("@")[1].split("+")[0])' "$DEPOT/package.json")"
-  [[ "$pnpm_version" =~ $VERSION_RE ]] || echouer "version de pnpm inattendue : $pnpm_version"
+  [[ "$pnpm_version" =~ $VERSION_RE ]] || echouer "version de pnpm inattendue dans package.json"
   printf '#!/bin/sh\nexec npx -y "pnpm@%s" "$@"\n' "$pnpm_version" >"$CALES/pnpm"
   chmod +x "$CALES/pnpm"
   cd "$DEPOT"

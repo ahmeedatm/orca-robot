@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { SOURCES, URL_FORK, creerBac, lancer } from './helpers.mjs'
@@ -67,6 +67,24 @@ describe('installer-robot.sh', () => {
   it('refuse une épingle au mauvais format', () => {
     assert.notEqual(installer(URL_FORK, 'pro', '--epingle', 'main').status, 0)
     assert.equal(existsSync(join(bac.config, 'epingle')), false)
+  })
+
+  it('refuse une épingle déjà posée au mauvais format', () => {
+    bac.epingle('--upload-pack=x')
+    assert.notEqual(installer(URL_FORK, 'pro').status, 0)
+    assert.equal(existsSync(bac.reserve), false)
+  })
+
+  it('un échec du clone ne laisse pas de cible écrite', () => {
+    renameSync(bac.nu('robot'), `${bac.nu('robot')}.coupe`)
+    assert.notEqual(installer(URL_FORK, 'perso').status, 0)
+    assert.equal(existsSync(join(bac.config, 'cible')), false)
+  })
+
+  it('consigne : l’agent ne pousse pas de code sur le robot', () => {
+    assert.equal(installer(URL_FORK, 'perso').status, 0)
+    assert.match(journalOrca(), /ne le corrige pas/)
+    assert.doesNotMatch(journalOrca(), /PR sur ahmeedatm\/orca-robot/)
   })
 
   it('espace de travail de réparation réglable', () => {
